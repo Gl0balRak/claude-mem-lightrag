@@ -1,6 +1,14 @@
 /**
  * CorpusStore - File I/O for corpus JSON files
  *
+ * MODIFIED FOR LIGHTRAG FORK:
+ * - On write/delete, additionally syncs to LightRAG (fire-and-forget)
+ * - When LightRAG is offline, the local JSON file is still written (no data loss),
+ *   but the LightRAGCorpusSync writes a pending entry to outbox and logs a
+ *   visible warning. Outbox is drained on next start when LightRAG is back.
+ * - This is NOT a fallback — local JSON is the canonical write path inside
+ *   claude-mem (always written), LightRAG is an additional indexing layer.
+ *
  * Manages reading, writing, listing, and deleting corpus files
  * stored in ~/.claude-mem/corpora/
  */
@@ -10,6 +18,7 @@ import * as path from 'node:path';
 import * as os from 'node:os';
 import { logger } from '../../../utils/logger.js';
 import type { CorpusFile, CorpusStats } from './types.js';
+import { getLightRAGCorpusSync } from './LightRAGCorpusSync.js';
 
 const CORPORA_DIR = path.join(os.homedir(), '.claude-mem', 'corpora');
 
@@ -26,11 +35,27 @@ export class CorpusStore {
 
   /**
    * Write a corpus file to disk as {name}.corpus.json
+   * Additionally syncs to LightRAG asynchronously (fire-and-forget with
+   * VISIBLE error logging — not silent).
    */
   write(corpus: CorpusFile): void {
     const filePath = this.getFilePath(corpus.name);
     fs.writeFileSync(filePath, JSON.stringify(corpus, null, 2), 'utf-8');
     logger.debug('WORKER', `Wrote corpus file: ${filePath} (${corpus.observations.length} observations)`);
+
+    // LightRAG sync — fire-and-forget. If LightRAG is offline, the sync method
+    // throws LightRAGUnavailableError, which writes the corpus to outbox.
+    // We log the error visibly so user knows memory indexing is degraded.
+    getLightRAGCorpusSync().syncCorpus(corpus).catch((err) => {
+      logger.error(
+        'WORKER',
+        `LightRAG corpus sync FAILED for "${corpus.name}". ` +
+          `Local JSON is saved, but semantic search will not see this corpus until ` +
+          `LightRAG is back online and outbox is drained.`,
+        { corpus: corpus.name },
+        err instanceof Error ? err : new Error(String(err))
+      );
+    });
   }
 
   /**
@@ -56,7 +81,7 @@ export class CorpusStore {
   }
 
   /**
-   * List all corpora metadata (reads each file but omits observations for efficiency)
+   * List all corpora metadata
    */
   list(): Array<{ name: string; description: string; stats: CorpusStats; session_id: string | null }> {
     if (!fs.existsSync(this.corporaDir)) {
@@ -89,7 +114,8 @@ export class CorpusStore {
   }
 
   /**
-   * Delete a corpus file, return true if it existed
+   * Delete a corpus file, return true if it existed.
+   * Additionally deletes corresponding documents from LightRAG.
    */
   delete(name: string): boolean {
     const filePath = this.getFilePath(name);
@@ -99,6 +125,19 @@ export class CorpusStore {
 
     fs.unlinkSync(filePath);
     logger.debug('WORKER', `Deleted corpus file: ${filePath}`);
+
+    // LightRAG sync delete
+    getLightRAGCorpusSync().deleteCorpus(name).catch((err) => {
+      logger.error(
+        'WORKER',
+        `LightRAG corpus delete FAILED for "${name}". ` +
+          `Local file removed, but LightRAG documents may persist until ` +
+          `LightRAG is online and outbox drains.`,
+        { corpus: name },
+        err instanceof Error ? err : new Error(String(err))
+      );
+    });
+
     return true;
   }
 
